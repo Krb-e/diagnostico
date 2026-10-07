@@ -227,7 +227,7 @@ body::after{
     <div class="meta">
       <div>⏱ <b>~60 seg</b></div>
       <div>✓ <b>Mayormente checklist</b></div>
-      <div>🔒 <b>Tus datos no se comparten</b></div>
+      <div>🔒 <b>Tus respuestas son para Krab-e</b></div>
     </div>
   </div>
 
@@ -610,8 +610,8 @@ function collect(){
 }
 
 // Estos destinatarios reciben cada diagnóstico a través de FormSubmit.
-const EMAIL_DESTINO = 'matias.g@krab-e.com';
-const EMAIL_COPIA = 'sebastian@krab-e.com';
+const EMAIL_DESTINO = 'sebastian@krab-e.com';
+const EMAIL_COPIA = 'matias.g@krab-e.com';
 let submitting = false;
 let acceptedPayload = '';
 let previousPayload = '';
@@ -621,6 +621,7 @@ function setSubmitStatus(message, state){
   const status = document.getElementById('submitStatus');
   status.textContent = message;
   status.dataset.state = state;
+  delete status.dataset.errorCode;
   status.hidden = false;
 }
 
@@ -672,11 +673,20 @@ async function sendEmail(data, id){
       body: JSON.stringify(buildEmail(data, id)),
       signal: controller.signal
     });
-    if(!response.ok) throw new Error('No pudimos enviar tu diagnóstico. Intentá nuevamente en unos minutos.');
-    const result = await response.json();
+    let result;
+    try { result = await response.json(); }
+    catch (_) { throw new Error('El servicio de correo devolvió una respuesta inesperada. Tus respuestas siguen acá.'); }
     // Un HTTP 200 no alcanza: el servicio también tiene que aceptar el envío.
-    if(!result || (result.success !== true && result.success !== 'true')){
-      throw new Error('No pudimos confirmar el envío. Tus respuestas siguen acá para que puedas reintentar.');
+    if(!response.ok || !result || (result.success !== true && result.success !== 'true')){
+      const serviceMessage = String(result && result.message || '').slice(0, 400);
+      const needsActivation = /activat/i.test(serviceMessage);
+      const error = new Error(needsActivation
+        ? 'El envío por correo todavía no está habilitado. Tus respuestas siguen en esta página y todavía no se enviaron. Intentá más tarde.'
+        : 'El servicio de correo no aceptó el envío. Tus respuestas siguen acá para que puedas reintentar.');
+      error.code = needsActivation ? 'activation_required' : 'provider_rejected';
+      // El diagnóstico técnico contiene solo el error del proveedor, sin respuestas ni contactos.
+      console.warn('Krab-e: respuesta del servicio de correo', {status:response.status, code:error.code, message:serviceMessage});
+      throw error;
     }
     return result;
   } finally {
@@ -736,6 +746,7 @@ function submitForm(e){
           ? 'No pudimos conectar con el servicio de envío. Revisá tu conexión e intentá nuevamente.'
           : error.message;
       setSubmitStatus(message, 'error');
+      document.getElementById('submitStatus').dataset.errorCode = error.code || 'connection_error';
     })
     .finally(() => { submitting = false; });
   return false;
