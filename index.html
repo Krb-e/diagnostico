@@ -128,6 +128,11 @@ body::after{
   border:none; border-radius:10px; padding:15px; cursor:pointer; transition:filter .15s;
 }
 .submit:hover{filter:brightness(1.08);}
+.submit:disabled{cursor:wait;opacity:.65;}
+.submit-status{margin:12px 0 0;padding:12px 14px;border:1px solid var(--ke-border);border-radius:10px;font-size:14px;line-height:1.6;overflow-wrap:anywhere;}
+.submit-status[data-state="success"]{color:var(--ke-ok);border-color:var(--ke-green);}
+.submit-status[data-state="error"]{color:var(--ke-bad);}
+.submit-status[data-state="pending"]{color:var(--ke-warn);}
 
 /* PANEL */
 .panel{position:sticky; top:74px;}
@@ -404,17 +409,18 @@ body::after{
       <!-- 6 -->
       <section class="sec">
         <div class="sec-top"></div>
-        <div class="sec-head"><div class="sec-n">6</div><div class="sec-titles"><div class="sec-title">¿A dónde te mandamos tu diagnóstico?</div><div class="sec-sub">Te enviamos la propuesta personalizada.</div></div></div>
+        <div class="sec-head"><div class="sec-n">6</div><div class="sec-titles"><div class="sec-title">¿A dónde te mandamos tu diagnóstico?</div><div class="sec-sub">Dejá tus datos para que podamos contactarte con una propuesta personalizada.</div></div></div>
         <div class="sec-body">
           <div class="two">
-            <div class="field"><label>Nombre</label><input id="c_nombre" type="text" placeholder="Tu nombre" required></div>
-            <div class="field"><label>Empresa</label><input id="c_empresa" type="text" placeholder="Nombre de la empresa" required></div>
+            <div class="field"><label for="c_nombre">Nombre</label><input maxlength="200" autocomplete="name" id="c_nombre" type="text" placeholder="Tu nombre" required></div>
+            <div class="field"><label for="c_empresa">Empresa</label><input maxlength="200" autocomplete="organization" id="c_empresa" type="text" placeholder="Nombre de la empresa" required></div>
           </div>
           <div class="two">
-            <div class="field"><label>Email</label><input id="c_email" type="email" placeholder="vos@empresa.com" required></div>
-            <div class="field"><label>WhatsApp (opcional)</label><input id="c_wa" type="text" placeholder="+54 9 ..."></div>
+            <div class="field"><label for="c_email">Email</label><input maxlength="254" autocomplete="email" id="c_email" type="email" placeholder="vos@empresa.com" required></div>
+            <div class="field"><label for="c_wa">WhatsApp (opcional)</label><input maxlength="50" autocomplete="tel" id="c_wa" type="tel" placeholder="+54 9 ..."></div>
           </div>
-          <button type="submit" class="submit">Guardar diagnóstico →</button>
+          <button type="submit" class="submit" aria-describedby="submitStatus">Guardar diagnóstico →</button>
+          <p id="submitStatus" class="submit-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
         </div>
       </section>
     </form>
@@ -579,7 +585,8 @@ function togglePanel(){
 }
 
 /* ===== Captura de lead → Google Sheets ===== */
-/* Pegá acá la URL del Web App de Apps Script (termina en /exec). Si queda vacío, funciona en modo demo. */
+/* CONFIGURACIÓN: pegá la URL de la aplicación web de Apps Script, terminada en /exec.
+   Usá el archivo apps-script-doPost.gs incluido y publicá su nueva versión. */
 const ENDPOINT = '';
 
 function val(id){const e=document.getElementById(id); return e?e.value.trim():'';}
@@ -602,20 +609,138 @@ function collect(){
   };
 }
 
+let submitting = false;
+let previousPayload = '';
+let previousRequestId = '';
+let savedPayload = '';
+
+function setSubmitStatus(message, state){
+  const status = document.getElementById('submitStatus');
+  status.textContent = message;
+  status.dataset.state = state;
+  status.hidden = false;
+}
+
+function newRequestId(){
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Un POST de formulario puede cruzar dominios. La respuesta del script confirma
+// el guardado por postMessage; cargar el iframe por sí solo no indica éxito.
+function saveDiagnosis(endpoint, payload, requestId){
+  return new Promise((resolve, reject) => {
+    const frame = document.createElement('iframe');
+    frame.name = 'krabe_save_' + requestId;
+    frame.title = 'Confirmación de guardado';
+    frame.hidden = true;
+    const transport = document.createElement('form');
+    transport.method = 'POST';
+    transport.action = endpoint;
+    transport.target = frame.name;
+    transport.hidden = true;
+    const fields = {payload, requestId, origin: window.location.origin};
+    Object.entries(fields).forEach(([name, value]) => {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = name;
+      input.value = value;
+      transport.appendChild(input);
+    });
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('message', receive);
+      transport.remove();
+      frame.remove();
+    };
+    const receive = event => {
+      // Apps Script ejecuta la respuesta dentro de un iframe de Google.
+      let sender;
+      try { sender = new URL(event.origin); } catch (_) { return; }
+      const trusted = sender.protocol === 'https:' &&
+        (sender.hostname === 'script.google.com' ||
+         sender.hostname === 'script.googleusercontent.com' ||
+         sender.hostname.endsWith('.script.googleusercontent.com') ||
+         /^[a-z0-9-]+-script\.googleusercontent\.com$/.test(sender.hostname));
+      const reply = event.data;
+      if(!trusted || !reply || reply.type !== 'krabe:save' || reply.requestId !== requestId) return;
+      if(reply.ok === true){ cleanup(); resolve(reply); }
+      else if(reply.ok === false){
+        cleanup();
+        reject(new Error(reply.message || 'No pudimos guardar el diagnóstico. Intentá nuevamente.'));
+      }
+    };
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error('No pudimos confirmar el guardado. Revisá tu conexión y volvé a intentar; tus respuestas siguen acá.'));
+    }, 45000);
+    window.addEventListener('message', receive);
+    document.body.appendChild(frame);
+    document.body.appendChild(transport);
+    try { transport.submit(); }
+    catch(error){ cleanup(); reject(error); }
+  });
+}
+
 function submitForm(e){
   e.preventDefault();
-  const data=collect();
-  const btn=e.target.querySelector('.submit');
-  if(!ENDPOINT){
-    alert('✓ Diagnóstico listo (modo demo)\n\nÍndice de Oportunidad: '+data.score+'/100\n\nPara guardar en Google Sheets, cargá la URL del Apps Script en la constante ENDPOINT.');
+  const form = e.target;
+  if(submitting || !form.reportValidity()) return false;
+  const data = collect();
+  if(!data.nombre || !data.empresa){
+    setSubmitStatus('Completá tu nombre y el de tu empresa para guardar el diagnóstico.', 'error');
     return false;
   }
-  const orig=btn.textContent; btn.textContent='Guardando…'; btn.disabled=true;
-  fetch(ENDPOINT,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(data)})
-    .then(()=>{btn.textContent='✓ Guardado'; alert('¡Gracias! Tu diagnóstico fue registrado.\n\nÍndice de Oportunidad: '+data.score+'/100');})
-    .catch(()=>{btn.textContent=orig; btn.disabled=false; alert('Hubo un problema al guardar. Reintentá en un momento.');});
+  const endpoint = ENDPOINT.trim().replace(/\/$/, '');
+  if(!/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(endpoint)){
+    setSubmitStatus('Tu diagnóstico está listo: ' + data.score + '/100. El guardado no está disponible por el momento. Tus datos todavía no se enviaron.', 'pending');
+    return false;
+  }
+  if(!/^https?:$/.test(window.location.protocol)){
+    setSubmitStatus('Abrí el formulario desde su sitio web para poder guardar tus respuestas.', 'error');
+    return false;
+  }
+  const payload = JSON.stringify(data);
+  if(payload !== previousPayload){
+    previousRequestId = newRequestId();
+    previousPayload = payload;
+  }
+  const btn = form.querySelector('.submit');
+  submitting = true;
+  btn.disabled = true;
+  btn.textContent = 'Guardando…';
+  setSubmitStatus('Estamos guardando tu diagnóstico…', 'pending');
+  saveDiagnosis(endpoint, payload, previousRequestId)
+    .then(() => {
+      savedPayload = payload;
+      const changed = JSON.stringify(collect()) !== payload;
+      btn.disabled = !changed;
+      btn.textContent = changed ? 'Guardar cambios →' : '✓ Guardado';
+      setSubmitStatus('¡Gracias! Tu diagnóstico fue registrado. Índice de Oportunidad: ' + data.score + '/100.' +
+        (changed ? ' Hay cambios posteriores al envío que todavía no se guardaron.' : ''), 'success');
+    })
+    .catch(error => {
+      btn.disabled = false;
+      btn.textContent = 'Reintentar guardado →';
+      setSubmitStatus(error.message, 'error');
+    })
+    .finally(() => { submitting = false; });
   return false;
 }
+
+function markUnsaved(){
+  if(submitting || !savedPayload || JSON.stringify(collect()) === savedPayload) return;
+  const btn = document.querySelector('#form .submit');
+  btn.disabled = false;
+  btn.textContent = 'Guardar cambios →';
+  setSubmitStatus('Cambiaste tus respuestas. Guardá los cambios para registrar el diagnóstico actualizado.', 'pending');
+}
+document.getElementById('form').addEventListener('input', markUnsaved);
+document.getElementById('form').addEventListener('click', event => {
+  if(event.target.closest('.chip, .check')) markUnsaved();
+});
+
 recompute();
 </script>
 </body>
