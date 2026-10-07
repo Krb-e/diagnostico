@@ -128,7 +128,8 @@ body::after{
   border:none; border-radius:10px; padding:15px; cursor:pointer; transition:filter .15s;
 }
 .submit:hover{filter:brightness(1.08);}
-.submit:disabled{cursor:wait;opacity:.65;}
+.submit:disabled{cursor:default;opacity:.65;}
+.submission-note{margin:12px 0;color:rgba(230,230,230,.7);font-size:12px;line-height:1.6;}
 .submit-status{margin:12px 0 0;padding:12px 14px;border:1px solid var(--ke-border);border-radius:10px;font-size:14px;line-height:1.6;overflow-wrap:anywhere;}
 .submit-status[data-state="success"]{color:var(--ke-ok);border-color:var(--ke-green);}
 .submit-status[data-state="error"]{color:var(--ke-bad);}
@@ -419,7 +420,10 @@ body::after{
             <div class="field"><label for="c_email">Email</label><input maxlength="254" autocomplete="email" id="c_email" type="email" placeholder="vos@empresa.com" required></div>
             <div class="field"><label for="c_wa">WhatsApp (opcional)</label><input maxlength="50" autocomplete="tel" id="c_wa" type="tel" placeholder="+54 9 ..."></div>
           </div>
-          <button type="submit" class="submit" aria-describedby="submitStatus">Guardar diagnóstico →</button>
+          <p id="localPreviewNote" class="submit-status" hidden>Estás viendo una copia desde tu disco. Para probar el envío, <a href="http://127.0.0.1:8765/diagnostico-email.html" style="color:var(--ke-orange)">abrí la versión de prueba</a>. Para compartir el formulario, usá la dirección del sitio publicado.</p>
+          <button type="submit" class="submit" aria-describedby="submitStatus">Enviar diagnóstico →</button>
+          <div hidden aria-hidden="true"><label for="contactWebsite">Sitio web</label><input type="text" id="contactWebsite" name="_honey" tabindex="-1" autocomplete="off"></div>
+          <p class="submission-note">Al enviar, compartís tus respuestas y datos de contacto con Krab-e a través de FormSubmit.</p>
           <p id="submitStatus" class="submit-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
         </div>
       </section>
@@ -584,11 +588,7 @@ function togglePanel(){
   if(window.innerWidth<=900) document.getElementById('panelCard').classList.toggle('collapse-m');
 }
 
-/* ===== Captura de lead → Google Sheets ===== */
-/* CONFIGURACIÓN: pegá la URL de la aplicación web de Apps Script, terminada en /exec.
-   Usá el archivo apps-script-doPost.gs incluido y publicá su nueva versión. */
-const ENDPOINT = '';
-
+/* ===== Envío del diagnóstico por email ===== */
 function val(id){const e=document.getElementById(id); return e?e.value.trim():'';}
 function selV(group){const c=document.querySelector('[data-single="'+group+'"] .chip.on'); return c?c.getAttribute('data-v'):'';}
 function listOn(scope){return Array.from(document.querySelectorAll(scope+' .check.on')).map(ch=>{const s=ch.querySelector('span:not(.box)'); return s?s.textContent.trim():'';}).filter(Boolean);}
@@ -609,10 +609,13 @@ function collect(){
   };
 }
 
+// Estos destinatarios reciben cada diagnóstico a través de FormSubmit.
+const EMAIL_DESTINO = 'matias.g@krab-e.com';
+const EMAIL_COPIA = 'sebastian@krab-e.com';
 let submitting = false;
+let acceptedPayload = '';
 let previousPayload = '';
-let previousRequestId = '';
-let savedPayload = '';
+let submissionId = '';
 
 function setSubmitStatus(message, state){
   const status = document.getElementById('submitStatus');
@@ -621,66 +624,64 @@ function setSubmitStatus(message, state){
   status.hidden = false;
 }
 
-function newRequestId(){
-  const bytes = new Uint8Array(16);
-  window.crypto.getRandomValues(bytes);
-  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+function buildEmail(data, id){
+  const text = value => Array.isArray(value) ? (value.join(', ') || 'Sin seleccionar') : (String(value || '') || 'Sin especificar');
+  return {
+    _subject: 'Diagnóstico Krab-e · ' + data.empresa.replace(/[\r\n]/g, ' ') + ' · ' + data.score + '/100',
+    _cc: EMAIL_COPIA,
+    _replyto: data.email,
+    _template: 'table',
+    _captcha: 'false',
+    _honey: document.getElementById('contactWebsite').value,
+    _url: window.location.href,
+    name: data.nombre,
+    email: data.email,
+    'Empresa': data.empresa,
+    'WhatsApp': text(data.whatsapp),
+    'Rubro': text(data.rubro),
+    'Tamaño del equipo': text(data.equipo),
+    'Facturación': text(data.facturacion),
+    'Canales de publicidad': text(data.pub),
+    'Plataformas de e-commerce': text(data.ecom),
+    'Herramientas de analítica': text(data.analitica),
+    'Otras herramientas': text(data.otras),
+    'Procesos resueltos': text(data.resuelto),
+    'Nivel técnico': text(data.nivel_tecnico),
+    'Herramientas de IA': text(data.ia),
+    'IA paga': text(data.ia_paga),
+    'Herramientas técnicas': text(data.tecnicas),
+    'Visibilidad del equipo': text(data.visibilidad),
+    'Tareas que consumen tiempo': text(data.tiempo),
+    'Medición de productividad': text(data.productividad),
+    'Objetivos': text(data.objetivos),
+    'Índice de oportunidad': data.score + '/100',
+    'Nivel de oportunidad': text(data.tier),
+    'Horas recuperables por semana (estimación)': text(data.horas),
+    'Focos recomendados': text(data.focos),
+    'ID del diagnóstico': id
+  };
 }
 
-// Un POST de formulario puede cruzar dominios. La respuesta del script confirma
-// el guardado por postMessage; cargar el iframe por sí solo no indica éxito.
-function saveDiagnosis(endpoint, payload, requestId){
-  return new Promise((resolve, reject) => {
-    const frame = document.createElement('iframe');
-    frame.name = 'krabe_save_' + requestId;
-    frame.title = 'Confirmación de guardado';
-    frame.hidden = true;
-    const transport = document.createElement('form');
-    transport.method = 'POST';
-    transport.action = endpoint;
-    transport.target = frame.name;
-    transport.hidden = true;
-    const fields = {payload, requestId, origin: window.location.origin};
-    Object.entries(fields).forEach(([name, value]) => {
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = name;
-      input.value = value;
-      transport.appendChild(input);
+async function sendEmail(data, id){
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 30000);
+  try {
+    const response = await fetch('https://formsubmit.co/ajax/' + EMAIL_DESTINO, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+      body: JSON.stringify(buildEmail(data, id)),
+      signal: controller.signal
     });
-    const cleanup = () => {
-      window.clearTimeout(timer);
-      window.removeEventListener('message', receive);
-      transport.remove();
-      frame.remove();
-    };
-    const receive = event => {
-      // Apps Script ejecuta la respuesta dentro de un iframe de Google.
-      let sender;
-      try { sender = new URL(event.origin); } catch (_) { return; }
-      const trusted = sender.protocol === 'https:' &&
-        (sender.hostname === 'script.google.com' ||
-         sender.hostname === 'script.googleusercontent.com' ||
-         sender.hostname.endsWith('.script.googleusercontent.com') ||
-         /^[a-z0-9-]+-script\.googleusercontent\.com$/.test(sender.hostname));
-      const reply = event.data;
-      if(!trusted || !reply || reply.type !== 'krabe:save' || reply.requestId !== requestId) return;
-      if(reply.ok === true){ cleanup(); resolve(reply); }
-      else if(reply.ok === false){
-        cleanup();
-        reject(new Error(reply.message || 'No pudimos guardar el diagnóstico. Intentá nuevamente.'));
-      }
-    };
-    const timer = window.setTimeout(() => {
-      cleanup();
-      reject(new Error('No pudimos confirmar el guardado. Revisá tu conexión y volvé a intentar; tus respuestas siguen acá.'));
-    }, 45000);
-    window.addEventListener('message', receive);
-    document.body.appendChild(frame);
-    document.body.appendChild(transport);
-    try { transport.submit(); }
-    catch(error){ cleanup(); reject(error); }
-  });
+    if(!response.ok) throw new Error('No pudimos enviar tu diagnóstico. Intentá nuevamente en unos minutos.');
+    const result = await response.json();
+    // Un HTTP 200 no alcanza: el servicio también tiene que aceptar el envío.
+    if(!result || (result.success !== true && result.success !== 'true')){
+      throw new Error('No pudimos confirmar el envío. Tus respuestas siguen acá para que puedas reintentar.');
+    }
+    return result;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 function submitForm(e){
@@ -689,57 +690,71 @@ function submitForm(e){
   if(submitting || !form.reportValidity()) return false;
   const data = collect();
   if(!data.nombre || !data.empresa){
-    setSubmitStatus('Completá tu nombre y el de tu empresa para guardar el diagnóstico.', 'error');
-    return false;
-  }
-  const endpoint = ENDPOINT.trim().replace(/\/$/, '');
-  if(!/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(endpoint)){
-    setSubmitStatus('Tu diagnóstico está listo: ' + data.score + '/100. El guardado no está disponible por el momento. Tus datos todavía no se enviaron.', 'pending');
+    setSubmitStatus('Completá tu nombre y el de tu empresa para enviar el diagnóstico.', 'error');
     return false;
   }
   if(!/^https?:$/.test(window.location.protocol)){
-    setSubmitStatus('Abrí el formulario desde su sitio web para poder guardar tus respuestas.', 'error');
+    setSubmitStatus('Abrí el formulario desde su sitio web para enviar tus respuestas.', 'error');
+    return false;
+  }
+  // El campo trampa queda vacío en los envíos de personas.
+  if(document.getElementById('contactWebsite').value){
+    setSubmitStatus('No pudimos enviar el diagnóstico. Recargá la página e intentá nuevamente.', 'error');
     return false;
   }
   const payload = JSON.stringify(data);
+  if(payload === acceptedPayload){
+    setSubmitStatus('Este diagnóstico ya fue recibido. Podés modificar tus respuestas para enviar una actualización.', 'success');
+    return false;
+  }
   if(payload !== previousPayload){
-    previousRequestId = newRequestId();
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    submissionId = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
     previousPayload = payload;
   }
   const btn = form.querySelector('.submit');
   submitting = true;
   btn.disabled = true;
-  btn.textContent = 'Guardando…';
-  setSubmitStatus('Estamos guardando tu diagnóstico…', 'pending');
-  saveDiagnosis(endpoint, payload, previousRequestId)
+  btn.textContent = 'Enviando…';
+  setSubmitStatus('Estamos enviando tu diagnóstico…', 'pending');
+  sendEmail(data, submissionId)
     .then(() => {
-      savedPayload = payload;
+      acceptedPayload = payload;
       const changed = JSON.stringify(collect()) !== payload;
       btn.disabled = !changed;
-      btn.textContent = changed ? 'Guardar cambios →' : '✓ Guardado';
-      setSubmitStatus('¡Gracias! Tu diagnóstico fue registrado. Índice de Oportunidad: ' + data.score + '/100.' +
-        (changed ? ' Hay cambios posteriores al envío que todavía no se guardaron.' : ''), 'success');
+      btn.textContent = changed ? 'Enviar actualización →' : '✓ Recibido';
+      setSubmitStatus('¡Gracias! Tu diagnóstico fue recibido. Índice de Oportunidad: ' + data.score + '/100.' +
+        (changed ? ' Hay cambios posteriores al envío que todavía no se enviaron.' : ''), 'success');
     })
     .catch(error => {
       btn.disabled = false;
-      btn.textContent = 'Reintentar guardado →';
-      setSubmitStatus(error.message, 'error');
+      btn.textContent = 'Reintentar envío →';
+      const message = error.name === 'AbortError'
+        ? 'El envío está tardando más de lo esperado y no pudimos confirmarlo. Tus respuestas siguen acá. Podés reintentar.'
+        : error instanceof TypeError
+          ? 'No pudimos conectar con el servicio de envío. Revisá tu conexión e intentá nuevamente.'
+          : error.message;
+      setSubmitStatus(message, 'error');
     })
     .finally(() => { submitting = false; });
   return false;
 }
 
 function markUnsaved(){
-  if(submitting || !savedPayload || JSON.stringify(collect()) === savedPayload) return;
+  if(submitting || !acceptedPayload || JSON.stringify(collect()) === acceptedPayload) return;
   const btn = document.querySelector('#form .submit');
   btn.disabled = false;
-  btn.textContent = 'Guardar cambios →';
-  setSubmitStatus('Cambiaste tus respuestas. Guardá los cambios para registrar el diagnóstico actualizado.', 'pending');
+  btn.textContent = 'Enviar actualización →';
+  setSubmitStatus('Cambiaste tus respuestas. Enviá la actualización para compartir el diagnóstico nuevo.', 'pending');
 }
 document.getElementById('form').addEventListener('input', markUnsaved);
 document.getElementById('form').addEventListener('click', event => {
   if(event.target.closest('.chip, .check')) markUnsaved();
 });
+if(window.location.protocol === 'file:'){
+  document.getElementById('localPreviewNote').hidden = false;
+}
 
 recompute();
 </script>
